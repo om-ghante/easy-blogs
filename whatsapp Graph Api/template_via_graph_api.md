@@ -2,7 +2,7 @@
 
 Company: Curlshell Pvt. Ltd.  
 Intern: Om Ghante  
-Role: Backend Developer Intern  
+Role: Software Developer Intern  
 Duration: Dec 2025 - Present
 
 # 1. Project Overview
