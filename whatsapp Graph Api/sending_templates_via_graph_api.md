@@ -72,6 +72,8 @@ graph LR
 
 # 4. System Architecture
 
+The architecture follows a **three-process model** deployed as separate services. The Django web server handles incoming API requests and decides whether to send messages immediately or schedule them for later. Celery Beat acts as the scheduler's clock, ticking every 3 seconds to check for due jobs. Celery Workers are the muscle — they pick up dispatched jobs from Redis and send messages to the Meta Graph API. This separation means each service can be scaled independently.
+
 ```mermaid
 flowchart TD
     subgraph "Frontend (Next.js)"
@@ -135,6 +137,8 @@ flowchart TD
 
 ### Three-Process Architecture (from Procfile)
 
+In production on Railway, we deploy three separate service types via a Procfile. Each runs as its own container/dyno, which means the web server never blocks on message sending, and the workers never interfere with API request handling. This is crucial for maintaining fast API response times even when sending millions of messages in the background.
+
 ```bash
 # Railway Procfile — 3 separate services
 
@@ -158,7 +162,7 @@ beat: celery -A core beat -l info --scheduler django_celery_beat.schedulers:Data
 
 # 5. The Universal Send API — Single Endpoint for Everything
 
-The core design decision was creating **one unified endpoint** that handles both Standard and Carousel templates. This eliminates the need for separate APIs and keeps the frontend simple.
+The core design decision was creating **one unified endpoint** (`POST /api/messaging/send`) that handles both Standard and Carousel templates. Before this, the system had separate code paths for different template types, leading to code duplication and inconsistencies. By unifying everything behind a single API, the frontend only needs to adjust the `templateType` field — all the branching and component building happens server-side.
 
 ## 5.1 Unified JSON Format
 
@@ -268,6 +272,8 @@ class UniversalSendSerializer(serializers.Serializer):
 
 ### Validation Rules Summary
 
+The serializer enforces strict cross-field validation rules to catch invalid payloads before they reach the service layer. This is especially important for carousel templates, which have a more complex structure than standard ones. By validating early, we avoid wasting time uploading media or calling the Meta API only to get a cryptic error back.
+
 | Field | Rule |
 |---|---|
 | `phoneNumbers` | At least 1, each must be 10+ digits |
@@ -282,7 +288,7 @@ class UniversalSendSerializer(serializers.Serializer):
 
 # 6. ComponentsBuilder — The Universal Component Engine
 
-The **ComponentsBuilder** is the core design pattern that makes the system truly universal. Both Standard and Carousel templates flow through the same builder, producing a `components[]` array for the Meta API.
+The **ComponentsBuilder** is the core design pattern that makes the system truly universal. Both Standard and Carousel templates flow through the same builder, producing a `components[]` array that the Meta Graph API expects. Without this abstraction, every place in the codebase that sends messages (immediate send, scheduled send, retry send) would need its own if/else logic for template types. The builder centralizes this complexity into one reusable class.
 
 ```mermaid
 flowchart LR
@@ -383,6 +389,8 @@ class ComponentsBuilder:
 
 ### What ComponentsBuilder Produces
 
+Here's what the builder outputs for each template type. The key difference is that standard templates have flat top-level components, while carousel templates wrap card-specific components inside a `CAROUSEL` container with `card_index` identifiers. Understanding this output format is critical because it must exactly match what the Meta Graph API expects — any structural deviation causes a `100` (Invalid Parameter) error.
+
 **Standard Template Output:**
 ```json
 [
@@ -419,6 +427,8 @@ class ComponentsBuilder:
 ---
 
 # 7. Immediate vs Scheduled — The Decision Logic
+
+When a send request comes in, the system must decide: should we send the messages right now, or store them in the database for later processing? This decision is based on the scheduled time the user provides. The sequence diagram below illustrates both paths — notice how the immediate path bypasses the database entirely (faster for the user), while the scheduled path creates persistent records that survive server restarts.
 
 ```mermaid
 sequenceDiagram
@@ -492,7 +502,7 @@ All scheduling internally uses **UTC**. The IST conversion happens only at the A
 
 # 8. Deduplication via MD5 Hashing
 
-To prevent duplicate campaigns (e.g., user clicks "Send" twice), every request is hashed:
+In a production environment, duplicate API requests are inevitable — users double-click buttons, browsers retry failed requests, and network issues cause repeated submissions. Without deduplication, a user could accidentally send the same campaign twice, wasting message credits and annoying recipients. We solve this with a simple but effective MD5 hash of all request parameters.
 
 ```python
 @staticmethod
@@ -533,6 +543,8 @@ if SchedulerJob.objects.filter(
 ---
 
 # 9. Database Models — SchedulerJob & SchedulerJobRecipient
+
+The scheduler's data model is designed around two key principles: (1) **job-level tracking** for the overall campaign status, and (2) **recipient-level tracking** for per-user delivery results. This two-table design enables error isolation — if sending to one phone number fails, we can retry just that recipient without re-processing the entire job. The ER diagram below shows the complete model structure.
 
 ```mermaid
 erDiagram
@@ -594,7 +606,7 @@ erDiagram
 
 # 10. Celery Beat Heartbeat — The Scheduler Engine
 
-This is the **core timing mechanism** of the entire system. Celery Beat runs as a separate process and ticks at regular intervals to dispatch due jobs.
+This is the **core timing mechanism** of the entire system. Unlike cron jobs that run at minute-level granularity, Celery Beat can tick at sub-second intervals. We configure it to trigger every 3 seconds, giving us near-real-time job dispatch. Beat itself does NOT process jobs — it only checks which jobs are due and pushes them into the Redis queue for workers to pick up. This separation is critical because Beat is a single process, while workers can scale to hundreds.
 
 ## 10.1 Celery Configuration (`core/celery.py`)
 
@@ -745,7 +757,9 @@ flowchart TD
 
 ### Why `SELECT FOR UPDATE SKIP LOCKED`?
 
-In a multi-server deployment, multiple Beat instances could pick up the same job. `SKIP LOCKED` ensures:
+In a multi-server deployment, multiple Beat instances or workers could try to pick up the same job simultaneously. Without distributed locking, this would cause duplicate message sends. PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` clause solves this elegantly at the database level — no external locking service (like Redis-based locks or ZooKeeper) needed.
+
+Here's how it works in practice:
 
 - If Server A locks Job #1, Server B **skips** it (doesn't block or wait)
 - No race conditions, no duplicate processing
@@ -858,6 +872,8 @@ flowchart TD
 
 ## 11.2 Worker Scaling & Concurrency
 
+One of the most impactful architectural decisions was choosing **Gevent** as the Celery worker pool instead of the default **prefork** (multiprocessing) pool. Since our workers are I/O-bound (they spend most of their time waiting for HTTP responses from the Meta API), Gevent's lightweight greenlets are far more efficient than OS-level processes. A single server can run 200 Gevent greenlets in ~50-100MB of RAM, whereas 200 prefork processes would consume 200× the memory.
+
 ### Production (Railway — Procfile)
 
 ```bash
@@ -881,6 +897,8 @@ celery -A core worker -l info --autoscale=250,10 -Q celery,scheduler,jobs
 
 ### Capacity Calculation
 
+The table below shows theoretical throughput at different worker counts. The 200ms delay between messages is our rate-limiting mechanism (via the Redis token bucket). In practice, actual throughput may be slightly lower due to network latency and Meta API response times, but these numbers are representative of what we've observed in production testing.
+
 | Workers | Delay | Throughput | 1M messages |
 |---|---|---|---|
 | 10 (idle) | 200ms | ~50 msg/sec | ~5.5 hours |
@@ -892,7 +910,7 @@ celery -A core worker -l info --autoscale=250,10 -Q celery,scheduler,jobs
 
 # 12. SyncWhatsAppClient — Production-Grade HTTP Client
 
-The `SyncWhatsAppClient` is used by Celery Workers for actual message delivery. It's designed for high-load scenarios.
+The `SyncWhatsAppClient` is used by Celery Workers for actual message delivery during scheduled sends. It's designed for high-load scenarios where thousands of messages are sent in rapid succession. The key optimization here is **connection pooling** — instead of opening a new TCP connection for every message (which incurs TLS handshake overhead each time), we maintain a pool of persistent connections that are reused across requests. This dramatically reduces latency and prevents connection exhaustion.
 
 ```python
 class SyncWhatsAppClient:
@@ -928,6 +946,8 @@ class SyncWhatsAppClient:
 ```
 
 ### Connection Pooling Explained
+
+Connection pooling is how we avoid the overhead of establishing a new HTTPS connection for every single message. Each connection in the pool maintains a persistent TCP socket with TLS already negotiated. When a worker needs to send a message, it borrows a connection from the pool, uses it, and returns it. The retry strategy also handles transient failures automatically — if Meta returns a `429` (rate limit) or `502` (bad gateway), the client automatically retries with exponential backoff (0.5s, 1s, 2s).
 
 ```mermaid
 flowchart LR

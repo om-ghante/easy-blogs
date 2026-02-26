@@ -157,9 +157,11 @@ The `get_value()` method automatically decrypts the stored value using the `FERN
 
 # 6. Database Models
 
+The system uses two separate models to manage templates — one internal and one synced from Meta. This separation is intentional: the internal `WhatsAppTemplate` is what our platform uses for campaign management and tenant assignment, while `CachedMetaTemplate` is a local mirror of what Meta actually has, enriched with our own classification data.
+
 ## 6.1 WhatsAppTemplate Model
 
-Internal template model for campaign management. SuperAdmin creates and assigns templates to tenants.
+This is the internal template model used for campaign management. A SuperAdmin creates templates here and assigns them to specific tenants via a many-to-many relationship. This model stores everything needed to render the template preview on the frontend, including header media files, body variables, and button configurations.
 
 ```python
 class WhatsAppTemplate(models.Model):
@@ -212,7 +214,7 @@ class WhatsAppTemplate(models.Model):
 
 ## 6.2 CachedMetaTemplate Model
 
-Cached copy of templates fetched from Meta Graph API with **internal classification** that Meta does NOT provide.
+This model serves as a **local cache** of all templates that exist on Meta's servers for a given tenant. When we sync with the Graph API, every template is fetched, classified by our regex engine, and stored here. The key insight is that Meta only gives you raw template data — it does NOT classify templates by industry, use case, or feature group. Our `CachedMetaTemplate` model adds these **derived fields** (`industry`, `feature_group`, `use_case`) so the frontend can offer rich filtering in the Template Library.
 
 ```python
 class CachedMetaTemplate(models.Model):
@@ -256,6 +258,8 @@ class CachedMetaTemplate(models.Model):
             models.Index(fields=['name'], name='cached_mt_name_idx'),
         ]
 ```
+
+The ER diagram below shows how these models relate to each other. Notice that `WhatsAppTemplate` uses a many-to-many relationship with `Tenant` for assignment, while `CachedMetaTemplate` uses a simple foreign key since each cached template belongs to exactly one tenant.
 
 ```mermaid
 erDiagram
@@ -301,6 +305,8 @@ erDiagram
 
 # 7. Complete Workflow Implementation
 
+The template creation workflow is a multi-step pipeline. When a user submits a template via the frontend, the request flows through validation, media upload (if applicable), handle injection, and finally submission to Meta. The sequence diagram below shows this complete lifecycle — pay attention to how the upload service is only invoked conditionally when media files are present.
+
 ```mermaid
 sequenceDiagram
     participant FE as Frontend
@@ -335,7 +341,7 @@ sequenceDiagram
 
 ## Step 1: Media File Validation (`upload_service.py`)
 
-When a user uploads media for a template, the `MetaMediaUploadService` validates it programmatically — replacing the manual `stat -c%s image.jpg` command.
+Before any media touches the Meta API, we validate it locally on our server. This replaces the old manual process of running `stat -c%s image.jpg` in the terminal to check file sizes. Our validation layer checks three things: (1) is the MIME type allowed by WhatsApp, (2) is the file within size limits, and (3) is the file non-empty. If any check fails, we return a user-friendly error immediately — saving the user from waiting for a Meta API rejection.
 
 ### Allowed File Types & Size Limits
 
@@ -381,6 +387,8 @@ def validate_file(file_data: bytes, content_type: str, filename: str = '') -> Tu
 
 ### MIME Type Detection Fallback
 
+Sometimes the browser sends an incorrect or missing `Content-Type` header. To handle this, we have a three-tier fallback: first try the provided type, then use Python's `mimetypes.guess_type()`, and finally fall back to a manual extension-to-MIME mapping. This ensures we never reject a valid file just because the browser mislabeled it.
+
 ```python
 @staticmethod
 def detect_content_type(filename: str, provided_type: str = '') -> str:
@@ -400,6 +408,8 @@ def detect_content_type(filename: str, provided_type: str = '') -> str:
 ```
 
 ## Step 2: Start Upload Session (Resumable Upload API)
+
+Meta's Resumable Upload API works in two phases. First, we start an "upload session" by telling Meta how large the file is and what type it is. Meta responds with a unique `session_id` (formatted as `upload:ABCxyz123...`). This session ID is then used in the next step to actually push the binary data. This two-phase approach allows Meta to pre-allocate storage and enables resumable uploads for large files.
 
 ```python
 def start_upload_session(self, file_length: int, file_type: str) -> Dict[str, Any]:
@@ -438,6 +448,8 @@ def start_upload_session(self, file_length: int, file_type: str) -> Dict[str, An
 ```
 
 ## Step 3: Upload Binary Media
+
+With the session ID in hand, we now upload the actual binary file data. There are two critical details here that caused me debugging headaches: (1) the Authorization header must use `OAuth` instead of the usual `Bearer` prefix — this is a Meta-specific quirk for binary uploads, and (2) we set a generous 120-second timeout because large video files (up to 16MB) can take time to transfer over slower connections.
 
 ```python
 def upload_binary(self, session_id: str, file_data: bytes, content_type: str) -> Dict[str, Any]:
@@ -480,7 +492,7 @@ def upload_binary(self, session_id: str, file_data: bytes, content_type: str) ->
 
 ## Step 4: Complete Upload Orchestration
 
-The `upload_media()` method chains all three steps into a single call:
+The `upload_media()` method is the public-facing API of the upload service. It chains all three steps (validate → start session → upload binary) into a single call, so the calling code (the `TemplateCreationService`) never needs to worry about the multi-step upload protocol. If any step fails, the method returns immediately with the error — no partial uploads left dangling.
 
 ```python
 def upload_media(self, file_data: bytes, content_type: str, filename: str = 'upload') -> Dict[str, Any]:
@@ -503,7 +515,7 @@ def upload_media(self, file_data: bytes, content_type: str, filename: str = 'upl
 
 # 8. Template Creation Service (`creation_service.py`)
 
-The `TemplateCreationService` is the **main orchestrator** that handles the complete template creation lifecycle.
+The `TemplateCreationService` is the **main orchestrator** that handles the complete template creation lifecycle. It coordinates between the upload service, the Meta Graph API, and the local database. The service follows the **Service Layer Pattern** — all business logic lives here, and the Django views are kept thin (they only handle HTTP request/response parsing and permission checks).
 
 ## 8.1 Validation Rules
 
@@ -557,7 +569,7 @@ def validate_template_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
 
 ## 8.2 Media Processing in Components
 
-The service automatically uploads media files and injects media handles into the correct component positions:
+This is where the real automation happens. When a user attaches media files to their template, we need to: (1) upload each file to Meta, (2) get back a media handle, and (3) inject that handle into the correct position in the components JSON. For standard templates, there's one header media. For carousel templates, each card can have its own media file. The method below handles both cases by iterating through the components and looking for media slots that need filling.
 
 ```python
 def process_media_in_components(self, components: List[Dict], media_files: Dict[str, Any]) -> List[Dict]:
@@ -634,6 +646,8 @@ Each media handle is injected into the card's `example.header_handle` array.
 
 ## 8.3 Template Submission to Meta
 
+Once all media handles are injected into the components, we submit the complete template payload to Meta's Graph API. The `allow_category_change` flag is important — when set to `true`, Meta may automatically re-categorize your template (e.g., from MARKETING to UTILITY) based on its content analysis. We enable this by default to increase approval chances.
+
 ```python
 def create_template(self, name, language, category, components, media_files=None, allow_category_change=True):
     # 1. Validate all fields
@@ -697,6 +711,8 @@ def create_template(self, name, language, category, components, media_files=None
 
 ## 8.4 Approval Status Tracking
 
+After submitting a template, it enters Meta's approval queue. Templates can be `PENDING`, `APPROVED`, `REJECTED`, or in rare cases, `PAUSED`. This method allows the frontend to poll for the current status of any template by name. It returns all language variants of the template along with quality scores and rejection reasons (if applicable).
+
 ```python
 def get_template_status(self, template_name: str) -> Dict[str, Any]:
     url = f'{GRAPH_API_URL}/{self.meta_service.waba_id}/message_templates'
@@ -732,6 +748,8 @@ def get_template_status(self, template_name: str) -> Dict[str, Any]:
 ```
 
 ## 8.5 Template Deletion
+
+Deleting a template from Meta is straightforward — a single DELETE request with the template name. However, it's important to note that this deletes **all language variants** of the template. After deletion, we also trigger a cache sync to remove the template from our local `CachedMetaTemplate` table.
 
 ```python
 def delete_template(self, template_name: str) -> Dict[str, Any]:
@@ -855,6 +873,8 @@ class MetaTemplateCreateView(generics.GenericAPIView):
 
 ## 9.4 Template Library View with Filters
 
+The Template Library is the main UI for browsing all templates that exist on Meta for a tenant. It serves cached data from `CachedMetaTemplate` (not live API calls) for fast response times. If no cached templates exist (first-time access), it automatically triggers a sync. The view supports filtering by category, status, industry, feature group, language, and more — all powered by the classification engine described in Section 10.
+
 ```python
 class TemplateLibraryView(generics.GenericAPIView):
     """GET /api/templates/meta/ — Cached templates with filters, counts & pagination."""
@@ -894,7 +914,11 @@ class TemplateLibraryView(generics.GenericAPIView):
 
 # 10. Template Sync & Classification Engine
 
+The sync engine is responsible for keeping our local template cache in sync with what actually exists on Meta's servers. It fetches all templates using cursor-based pagination, classifies each one using our regex engine, extracts metadata for fast filtering, and removes any templates from our cache that no longer exist on Meta.
+
 ## 10.1 Sync Service (`sync_service.py`)
+
+The sync process works in three phases: **Fetch** (paginate through Meta's API to get all templates), **Process** (classify and extract metadata for each template), and **Clean** (remove stale entries that Meta no longer has). The entire operation runs inside a database transaction to ensure consistency.
 
 ```mermaid
 flowchart TD
@@ -968,7 +992,9 @@ def sync_templates_for_tenant(tenant) -> Dict[str, Any]:
 
 ## 10.2 Classification Engine (`classifier.py`)
 
-Since Meta does NOT provide industry/feature_group/use_case classifications, I built a **regex-based classification engine** with 50+ pattern rules:
+This was one of the more interesting design challenges in the project. Meta's Graph API returns templates with basic fields like `name`, `category`, and `status` — but it does NOT tell you what industry a template belongs to, what feature it supports, or what specific use case it serves. For a Template Library with rich filtering, we needed this classification data.
+
+The solution: a **regex-based classification engine** with 50+ pattern rules. It scans the template name and body text against patterns like `order.*confirm` (→ E-commerce / Order Management) or `otp|one.time` (→ Authentication / OTP). If no pattern matches, it falls back to category-based defaults.
 
 ```python
 CLASSIFICATION_RULES: list[Tuple[str, Dict[str, str]]] = [
@@ -1011,6 +1037,8 @@ def classify_template(name: str, category: str = '', body_text: str = '') -> Dic
 
 ### Metadata Extraction
 
+Beyond classification, we also extract structural metadata from each template's components array. This includes whether the template has a header (and what format — image, video, text), whether it has buttons (and how many), and the body text (for search indexing). These extracted fields are stored as dedicated database columns with indexes, enabling fast filtering without having to parse the JSON `components` field on every query.
+
 ```python
 def extract_template_metadata(components: list) -> Dict:
     result = {'has_header': False, 'header_format': '', 'has_buttons': False, 'button_count': 0, 'body_text': ''}
@@ -1029,6 +1057,8 @@ def extract_template_metadata(components: list) -> Dict:
 ```
 
 ### Filter Counts for Template Library Sidebar
+
+The Template Library sidebar shows count badges next to each filter option (e.g., "Marketing (12)", "Approved (45)"). These counts are computed **before** applying the user's current filters, so the user always sees the total available options. This is a common UX pattern borrowed from e-commerce category pages.
 
 ```python
 def get_filter_counts(tenant) -> Dict[str, Any]:
@@ -1083,7 +1113,11 @@ flowchart LR
 
 # 12. Error Handling
 
+Robust error handling was critical for this project because we're integrating with an external API (Meta Graph API) that can fail in many ways — network timeouts, expired tokens, rate limits, invalid parameters, policy violations, etc. The system uses a three-layer error handling approach: custom exceptions for internal errors, friendly error message mapping for Meta API errors, and HTTP status code mapping for the REST API responses.
+
 ### Custom Exceptions
+
+We define custom exception classes so that errors can carry both a human-readable message and a machine-readable code. This allows the frontend to handle specific error types differently (e.g., showing a "reconfigure credentials" prompt for `NOT_CONFIGURED` vs. a simple retry button for `TIMEOUT`).
 
 ```python
 class MediaUploadError(Exception):
@@ -1102,6 +1136,8 @@ class TemplateCreationError(Exception):
 
 ### Friendly Error Messages for Common Meta API Errors
 
+Meta's API returns cryptic error codes and technical messages that would confuse end users. We maintain a mapping of common error codes to friendly, actionable messages. For example, error code `2388023` from Meta just means "duplicate name" — but we translate it to "Template name already exists. Choose a different name." This small touch significantly improves the user experience.
+
 ```python
 friendly_errors = {
     '100': 'Invalid parameter. Check your template components structure.',
@@ -1117,6 +1153,8 @@ subcode_errors = {
 ```
 
 ### Meta API Error Parser
+
+Meta's error responses have a nested structure (`response.error.message`, `response.error.code`, etc.). This utility method safely extracts that nested data, handling cases where the response might not even be valid JSON. It's used throughout the codebase wherever we call the Meta API.
 
 ```python
 @staticmethod
