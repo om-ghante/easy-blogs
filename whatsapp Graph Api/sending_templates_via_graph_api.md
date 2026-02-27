@@ -15,7 +15,7 @@ After building the **WhatsApp Template Creation & Approval Automation System** (
 - Sending **Carousel templates** (multi-card swipeable) to multiple recipients
 - **Immediate dispatch** — messages sent right now
 - **Scheduled dispatch** — messages queued for a specific date and time (IST → UTC conversion)
-- **Celery Beat heartbeat** — a scheduler loop that picks up due jobs every **3 seconds**
+- **Celery Beat heartbeat** — a scheduler loop that picks up due jobs every **1 second** (iterated from 60s → 3s based on team feedback)
 - **Celery Worker with autoscale** — dynamically scaling from **10 to 250 concurrent workers**
 - **Distributed locking** — preventing duplicate processing via `SELECT FOR UPDATE SKIP LOCKED`
 - **Deduplication** — MD5 hashing to prevent duplicate API requests
@@ -72,7 +72,7 @@ graph LR
 
 # 4. System Architecture
 
-The architecture follows a **three-process model** deployed as separate services. The Django web server handles incoming API requests and decides whether to send messages immediately or schedule them for later. Celery Beat acts as the scheduler's clock, ticking every 3 seconds to check for due jobs. Celery Workers are the muscle — they pick up dispatched jobs from Redis and send messages to the Meta Graph API. This separation means each service can be scaled independently.
+The architecture follows a **three-process model** deployed as separate services. The Django web server handles incoming API requests and decides whether to send messages immediately or schedule them for later. Celery Beat acts as the scheduler's clock, ticking every 1 second to check for due jobs. Celery Workers are the muscle — they pick up dispatched jobs from Redis and send messages to the Meta Graph API. This separation means each service can be scaled independently.
 
 ```mermaid
 flowchart TD
@@ -98,7 +98,7 @@ flowchart TD
     end
 
     subgraph "Celery Beat Process"
-        BEAT[Celery Beat - 3s heartbeat]
+        BEAT[Celery Beat - 1s heartbeat]
         HB[scheduler_heartbeat task]
     end
 
@@ -126,7 +126,7 @@ flowchart TD
 
     TIMECHK -->|"future time"| SJOB
 
-    BEAT -->|"every 3s"| HB
+    BEAT -->|"every 1s"| HB
     HB -->|"fetch_due_jobs()"| SJOB
     HB -->|"dispatch to queue"| WORKER
     WORKER --> PROC
@@ -156,7 +156,32 @@ beat: celery -A core beat -l info --scheduler django_celery_beat.schedulers:Data
 |---|---|---|
 | **Web** | Handles API requests, validates input, creates scheduled jobs | 2 workers × 4 threads |
 | **Worker** | Processes jobs, sends messages via Graph API | 200 gevent greenlets (prod) / autoscale 10-250 (local) |
-| **Beat** | Ticks every 3 seconds, dispatches due jobs to workers | Single process |
+| **Beat** | Ticks every 1 second, dispatches due jobs to workers | Single process |
+
+### 4.1 Django App Directory Structure
+
+The system is divided into two primary Django apps: `messaging` (for immediate sends and component building) and `scheduler` (for background jobs, rate limiting, and celery tasks).
+
+```text
+Whatsapp-Marketing-Api/
+├── messaging/                      # Immediate Send & Core Components
+│   ├── models.py                   # Conversation & Message tracking
+│   ├── serializers.py              # UniversalSendSerializer with strict validation
+│   ├── universal_send.py           # UniversalSendService coordinating paths
+│   ├── views.py                    # Unified POST /api/messaging/send endpoint
+│   └── whatsapp_service.py         # ComponentsBuilder engine for universal components
+│
+├── scheduler/                      # Background Queue & Distribution
+│   ├── models.py                   # SchedulerJob & SchedulerJobRecipient
+│   ├── tasks.py                    # Celery beat heartbeat and worker processing logic
+│   ├── views.py                    # Job management API (cancel, status, retry)
+│   └── services/                   # Heavy lifting logic
+│       ├── async_whatsapp.py       # Async httpx client for immediate sends
+│       ├── phone_validation.py     # Recipient formatting verification
+│       ├── rate_limiter.py         # Redis Lua token bucket rate limiter
+│       ├── scheduler_service.py    # Job creation, IST->UTC, distributed locking
+│       └── sync_whatsapp.py        # requests.Session client with connection pooling
+```
 
 ---
 
@@ -436,7 +461,7 @@ sequenceDiagram
     participant API as Django API
     participant SVC as UniversalSendService
     participant DB as PostgreSQL
-    participant BEAT as Celery Beat (3s)
+    participant BEAT as Celery Beat (1s)
     participant WORKER as Celery Worker
 
     FE->>API: POST /api/messaging/send
@@ -455,7 +480,7 @@ sequenceDiagram
         SVC->>DB: Create SchedulerJob + Recipients
         SVC-->>API: {scheduled: true, jobId: "uuid"}
         Note over BEAT: ... time passes ...
-        BEAT->>DB: fetch_due_jobs() [every 3s]
+        BEAT->>DB: fetch_due_jobs() [every 1s]
         BEAT->>WORKER: process_scheduler_job.apply_async()
         WORKER->>WORKER: ComponentsBuilder.for_template_type()
         WORKER->>META: SyncWhatsAppClient.send_batch()
@@ -554,8 +579,8 @@ erDiagram
 
     SchedulerJob {
         UUID id PK
-        FK tenant_id
-        FK campaign_id
+        UUID tenant_id FK
+        UUID campaign_id FK
         string template_name
         string template_type
         string language_code
@@ -577,7 +602,7 @@ erDiagram
 
     SchedulerJobRecipient {
         UUID id PK
-        FK job_id
+        UUID job_id FK
         string phone_number
         string contact_name
         JSON custom_body_params
@@ -606,7 +631,7 @@ erDiagram
 
 # 10. Celery Beat Heartbeat — The Scheduler Engine
 
-This is the **core timing mechanism** of the entire system. Unlike cron jobs that run at minute-level granularity, Celery Beat can tick at sub-second intervals. We configure it to trigger every 3 seconds, giving us near-real-time job dispatch. Beat itself does NOT process jobs — it only checks which jobs are due and pushes them into the Redis queue for workers to pick up. This separation is critical because Beat is a single process, while workers can scale to hundreds.
+This is the **core timing mechanism** of the entire system. Unlike cron jobs that run at minute-level granularity, Celery Beat can tick at sub-second intervals. We configure it to trigger every 1 second, giving us near-real-time job dispatch. Beat itself does NOT process jobs — it only checks which jobs are due and pushes them into the Redis queue for workers to pick up. This separation is critical because Beat is a single process, while workers can scale to hundreds.
 
 ## 10.1 Celery Configuration (`core/celery.py`)
 
@@ -621,7 +646,7 @@ app.autodiscover_tasks()
 app.conf.beat_schedule = {
     'scheduler-heartbeat': {
         'task': 'scheduler.tasks.scheduler_heartbeat',
-        'schedule': 3.0,  # ⚡ Every 3 seconds — fast pickup
+        'schedule': 1.0,  # ⚡ Every 1 second — fast pickup
         'options': {'queue': 'scheduler'}
     },
     'scheduler-cleanup': {
@@ -636,7 +661,7 @@ app.conf.beat_schedule = {
 flowchart TD
     subgraph "Celery Beat Process (Single Instance)"
         BEAT[Celery Beat]
-        TICK["Tick every 3 seconds"]
+        TICK["Tick every 1 second"]
         BEAT --> TICK
     end
 
@@ -670,7 +695,7 @@ flowchart TD
 @shared_task(name='scheduler.tasks.scheduler_heartbeat')
 def scheduler_heartbeat():
     """
-    Main scheduler heartbeat — runs every 3 seconds via Celery Beat.
+    Main scheduler heartbeat — runs every 1 second via Celery Beat.
     Fetches due jobs and dispatches them for processing.
     Uses distributed locking to prevent race conditions.
     """
@@ -698,9 +723,9 @@ def scheduler_heartbeat():
 
 | Parameter | Value | Explanation |
 |---|---|---|
-| **Beat interval** | 3 seconds | How often Celery Beat triggers `scheduler_heartbeat` |
-| **Max pickup delay** | ~3 seconds | Worst case: job becomes due 1ms after a heartbeat tick |
-| **Avg pickup delay** | ~1.5 seconds | On average, half the interval |
+| **Beat interval** | 1 second | How often Celery Beat triggers `scheduler_heartbeat` |
+| **Max pickup delay** | ~1 second | Worst case: job becomes due 1ms after a heartbeat tick |
+| **Avg pickup delay** | ~0.5 seconds | On average, half the interval |
 | **Cleanup interval** | 5 minutes | How often stale jobs are detected and reset |
 | **Stale threshold** | 10 minutes | Jobs stuck in `PROCESSING` for 10+ min are considered stale |
 
@@ -1019,7 +1044,7 @@ CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes max per task
 
 **How it works:**
 
-1. **Publishing Tasks**: When Celery Beat ticks (every 3 seconds), or when the API dispatches an immediate send, the task payload is serialized to JSON and pushed into a Redis list (queue).
+1. **Publishing Tasks**: When Celery Beat ticks (every 1 second), or when the API dispatches an immediate send, the task payload is serialized to JSON and pushed into a Redis list (queue).
 2. **Worker Consumption**: The Celery Gevent workers continuously listen to Redis via `BRPOP`. When a task appears in the queue, an idle greenlet instantly picks it up and begins execution.
 3. **Result Storage**: After a task completes, its return value and status (`SUCCESS`, `FAILURE`) are written back to Redis as the "Result Backend", allowing the system to track task state.
 
@@ -1251,7 +1276,7 @@ sequenceDiagram
 
     Note over User,Meta: === EXECUTION PHASE (at 9:30 AM UTC) ===
 
-    Beat->>Beat: Tick #N (every 3 seconds)
+    Beat->>Beat: Tick #N (every 1 second)
     Beat->>DB: SELECT ... WHERE status='pending' AND scheduled_time <= now FOR UPDATE SKIP LOCKED
     DB-->>Beat: Job "abc" found
     Beat->>DB: UPDATE status='processing', claimed_by='server_01'
@@ -1296,7 +1321,7 @@ Successfully built a **production-grade, Celery-powered distributed message deli
 
 - Sends **Standard and Carousel** WhatsApp templates via a **single unified API endpoint**
 - Supports **immediate and scheduled** delivery with IST → UTC conversion
-- Uses **Celery Beat (3-second heartbeat)** for near-real-time job dispatch
+- Uses **Celery Beat (1-second heartbeat)** for near-real-time job dispatch
 - Uses **Celery Workers (200 gevent greenlets)** for high-concurrency message sending
 - Implements **distributed locking** via PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED`
 - Provides **MD5 deduplication** to prevent accidental duplicate campaigns
